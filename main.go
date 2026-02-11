@@ -425,6 +425,10 @@ func checkNodeStatus(node corev1.Node, role string, clientset *kubernetes.Client
 		if role == "primary" {
 			fmt.Printf("  PRIMARY NODE DOWN: Initiating failover procedures...\n")
 
+			// Get node's zone
+			nodeZone := getNodeZone(node)
+			fmt.Printf("  Node zone: %s\n", nodeZone)
+
 			// 1. Check if there are available backup nodes
 			backupNodesCount := checkAvailableBackupNodes(clientset)
 			if backupNodesCount > 0 {
@@ -459,7 +463,19 @@ func checkNodeStatus(node corev1.Node, role string, clientset *kubernetes.Client
 				fmt.Printf("  CRITICAL: No primary nodes available! Promoting backup nodes...\n")
 				promoteBackupNodes(clientset)
 			} else {
-				fmt.Printf("  INFO: Found %d available primary nodes, no need to promote backup nodes\n", availablePrimaryNodes)
+				// Check if there are available primary nodes in the same zone
+				availablePrimaryNodesInZone := 0
+				if enableMultiAZ && nodeZone != "" {
+					availablePrimaryNodesInZone = countAvailablePrimaryNodesInZone(clientset, nodeZone)
+					fmt.Printf("  INFO: Found %d available primary nodes in zone %s\n", availablePrimaryNodesInZone, nodeZone)
+				}
+
+				if availablePrimaryNodesInZone == 0 {
+					fmt.Printf("  CRITICAL: No primary nodes available in zone %s! Promoting backup nodes...\n", nodeZone)
+					promoteBackupNodesInZone(clientset, nodeZone)
+				} else {
+					fmt.Printf("  INFO: Found %d available primary nodes, no need to promote backup nodes\n", availablePrimaryNodes)
+				}
 			}
 
 			// 6. Optional: Send notification (could be extended to use webhooks, etc.)
@@ -501,9 +517,23 @@ func checkNodeStatus(node corev1.Node, role string, clientset *kubernetes.Client
 							fmt.Printf("  WARNING: Only %d primary node available. Promoting backup nodes...\n", availablePrimaryNodes)
 							promoteBackupNodes(clientset)
 						} else {
-							// Other primary nodes available, mark this node as overloaded
-							fmt.Printf("  INFO: Found %d available primary nodes, marking this node as overloaded\n", availablePrimaryNodes)
-							markNodeAsOverloaded(node.Name)
+							// Check if there are available primary nodes in the same zone
+							nodeZone := getNodeZone(node)
+							availablePrimaryNodesInZone := 0
+							if enableMultiAZ && nodeZone != "" {
+								availablePrimaryNodesInZone = countAvailablePrimaryNodesInZone(clientset, nodeZone)
+								fmt.Printf("  INFO: Found %d available primary nodes in zone %s\n", availablePrimaryNodesInZone, nodeZone)
+							}
+
+							if availablePrimaryNodesInZone <= 1 {
+								// Only one primary node available in this zone, need to promote backup nodes in the same zone
+								fmt.Printf("  WARNING: Only %d primary node available in zone %s. Promoting backup nodes...\n", availablePrimaryNodesInZone, nodeZone)
+								promoteBackupNodesInZone(clientset, nodeZone)
+							} else {
+								// Other primary nodes available in this zone, mark this node as overloaded
+								fmt.Printf("  INFO: Found %d available primary nodes, marking this node as overloaded\n", availablePrimaryNodes)
+								markNodeAsOverloaded(node.Name)
+							}
 						}
 					} else {
 						// Resource usage is normal, remove overload taint if present
@@ -640,6 +670,10 @@ func handleNodeRecovery(node corev1.Node, clientset *kubernetes.Clientset) {
 	// Remove overload taint if present
 	removeNodeOverloadTaint(node.Name)
 
+	// Get node's zone
+	nodeZone := getNodeZone(node)
+	fmt.Printf("  Node zone: %s\n", nodeZone)
+
 	// Check if node is a primary node
 	if val, ok := node.Labels["node-role.kubernetes.io/role"]; ok && val == "primary" {
 		fmt.Printf("  INFO: Primary node %s has recovered\n", node.Name)
@@ -648,14 +682,37 @@ func handleNodeRecovery(node corev1.Node, clientset *kubernetes.Clientset) {
 		currentBackupNodesCount := checkAvailableBackupNodes(clientset)
 		fmt.Printf("  INFO: Current backup nodes count: %d, Initial: %d\n", currentBackupNodesCount, initialBackupNodesCount)
 
-		// If backup nodes count is less than initial, demote this node to backup
-		if currentBackupNodesCount < initialBackupNodesCount {
-			fmt.Printf("  INFO: Backup nodes count is less than initial. Demoting node %s to backup\n", node.Name)
-			demoteNodeToBackup(node.Name)
+		// Check backup nodes count in the same zone if multi-AZ is enabled
+		if enableMultiAZ && nodeZone != "" {
+			// Check if there are promoted backup nodes in the same zone that can be demoted
+			demotePromotedBackupNodesInZone(clientset, nodeZone)
+
+			// Check if backup nodes count in the same zone is sufficient
+			currentBackupNodesCountInZone := checkAvailableBackupNodesInZone(clientset, nodeZone)
+			fmt.Printf("  INFO: Current backup nodes count in zone %s: %d\n", nodeZone, currentBackupNodesCountInZone)
+
+			// If backup nodes count in the same zone is less than initial per zone, demote this node to backup
+			initialBackupNodesCountPerZone := initialBackupNodesCount / 3 // Assume 3 zones
+			if initialBackupNodesCountPerZone < 1 {
+				initialBackupNodesCountPerZone = 1
+			}
+
+			if currentBackupNodesCountInZone < initialBackupNodesCountPerZone {
+				fmt.Printf("  INFO: Backup nodes count in zone %s is less than initial. Demoting node %s to backup\n", nodeZone, node.Name)
+				demoteNodeToBackup(node.Name)
+			} else {
+				fmt.Printf("  INFO: Backup nodes count in zone %s is sufficient. Keeping node %s as primary\n", nodeZone, node.Name)
+			}
 		} else {
-			fmt.Printf("  INFO: Backup nodes count is sufficient. Keeping node %s as primary\n", node.Name)
-			// Check if there are promoted backup nodes that can be demoted
-			demotePromotedBackupNodes(clientset)
+			// If backup nodes count is less than initial, demote this node to backup
+			if currentBackupNodesCount < initialBackupNodesCount {
+				fmt.Printf("  INFO: Backup nodes count is less than initial. Demoting node %s to backup\n", node.Name)
+				demoteNodeToBackup(node.Name)
+			} else {
+				fmt.Printf("  INFO: Backup nodes count is sufficient. Keeping node %s as primary\n", node.Name)
+				// Check if there are promoted backup nodes that can be demoted
+				demotePromotedBackupNodes(clientset)
+			}
 		}
 	} else {
 		fmt.Printf("  INFO: Backup node %s has recovered\n", node.Name)
@@ -1065,4 +1122,193 @@ func selectPromotedNodeToDemoteByZone(zoneMap map[string]*zoneInfo, clientset *k
 	}
 
 	return promotedNodes[0].name
+}
+
+func countAvailablePrimaryNodesInZone(clientset *kubernetes.Clientset, zone string) int {
+	nodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return 0
+	}
+
+	count := 0
+	for _, node := range nodes.Items {
+		// Check if node is in the specified zone
+		if nodeZone := getNodeZone(node); nodeZone != zone {
+			continue
+		}
+
+		// Check if node is a primary node
+		if val, ok := node.Labels["node-role.kubernetes.io/role"]; ok && val == "primary" {
+			// Check if node is ready
+			isReady := false
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+					isReady = true
+					break
+				}
+			}
+			if isReady {
+				count++
+			}
+		}
+	}
+
+	return count
+}
+
+func promoteBackupNodesInZone(clientset *kubernetes.Clientset, zone string) {
+	// Get all nodes
+	nodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		fmt.Printf("  ERROR: Failed to list nodes: %v\n", err)
+		return
+	}
+
+	// Find available backup nodes in the specified zone (nodes without role label)
+	type backupNodeWithResources struct {
+		name            string
+		availableCPU    int64
+		availableMemory int64
+	}
+
+	availableBackupNodes := []backupNodeWithResources{}
+
+	for _, node := range nodes.Items {
+		// Check if node is in the specified zone
+		if nodeZone := getNodeZone(node); nodeZone != zone {
+			continue
+		}
+
+		// Check if node is a backup node (no role label)
+		if _, ok := node.Labels["node-role.kubernetes.io/role"]; !ok {
+			// Check if node is ready
+			isReady := false
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+					isReady = true
+					break
+				}
+			}
+			if isReady {
+				// Calculate available resources
+				var availableCPU int64
+				var availableMemory int64
+
+				for resourceName, quantity := range node.Status.Allocatable {
+					if resourceName == "cpu" {
+						availableCPU = quantity.MilliValue()
+					} else if resourceName == "memory" {
+						availableMemory = quantity.Value()
+					}
+				}
+
+				for resourceName, quantity := range node.Status.Capacity {
+					if resourceName == "cpu" && availableCPU == 0 {
+						availableCPU = quantity.MilliValue()
+					} else if resourceName == "memory" && availableMemory == 0 {
+						availableMemory = quantity.Value()
+					}
+				}
+
+				availableBackupNodes = append(availableBackupNodes, backupNodeWithResources{
+					name:            node.Name,
+					availableCPU:    availableCPU,
+					availableMemory: availableMemory,
+				})
+			}
+		}
+	}
+
+	if len(availableBackupNodes) == 0 {
+		fmt.Printf("  ERROR: No available backup nodes in zone %s to promote\n", zone)
+		return
+	}
+
+	// Select the backup node with the most available resources (using CPU as primary metric, memory as secondary)
+	selectedNode := availableBackupNodes[0]
+	for _, node := range availableBackupNodes {
+		if node.availableCPU > selectedNode.availableCPU {
+			selectedNode = node
+		} else if node.availableCPU == selectedNode.availableCPU && node.availableMemory > selectedNode.availableMemory {
+			selectedNode = node
+		}
+	}
+
+	fmt.Printf("  INFO: Promoting backup node %s from zone %s to primary (Available CPU: %dm, Memory: %dMi)\n",
+		selectedNode.name, zone, selectedNode.availableCPU, selectedNode.availableMemory/(1024*1024))
+
+	// Add primary label and promoted label to the backup node
+	cmd := exec.Command("kubectl", "label", "nodes", selectedNode.name, "node-role.kubernetes.io/role=primary", "node-role.kubernetes.io/promoted=true", "--overwrite")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("  ERROR: Failed to promote node %s: %s\n", selectedNode.name, string(output))
+	} else {
+		fmt.Printf("  SUCCESS: Node %s has been promoted to primary\n", selectedNode.name)
+	}
+}
+
+func checkAvailableBackupNodesInZone(clientset *kubernetes.Clientset, zone string) int {
+	nodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return 0
+	}
+
+	count := 0
+	for _, node := range nodes.Items {
+		// Check if node is in the specified zone
+		if nodeZone := getNodeZone(node); nodeZone != zone {
+			continue
+		}
+
+		// Check if node is a backup node (no role label)
+		if _, ok := node.Labels["node-role.kubernetes.io/role"]; !ok {
+			// Check if node is ready
+			isReady := false
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+					isReady = true
+					break
+				}
+			}
+			if isReady {
+				count++
+			}
+		}
+	}
+
+	return count
+}
+
+func demotePromotedBackupNodesInZone(clientset *kubernetes.Clientset, zone string) {
+	// Get all nodes
+	nodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		fmt.Printf("  ERROR: Failed to list nodes: %v\n", err)
+		return
+	}
+
+	// Find promoted backup nodes in the specified zone (nodes that were originally backup but now have primary label)
+	promotedNodes := []string{}
+	for _, node := range nodes.Items {
+		// Check if node is in the specified zone
+		if nodeZone := getNodeZone(node); nodeZone != zone {
+			continue
+		}
+
+		if val, ok := node.Labels["node-role.kubernetes.io/role"]; ok && val == "primary" {
+			// Check if node has a promoted label
+			if _, promoted := node.Labels["node-role.kubernetes.io/promoted"]; promoted {
+				promotedNodes = append(promotedNodes, node.Name)
+			}
+		}
+	}
+
+	if len(promotedNodes) == 0 {
+		return
+	}
+
+	// Demote the first promoted backup node
+	nodeToDemote := promotedNodes[0]
+	fmt.Printf("  INFO: Demoting promoted node %s back to backup\n", nodeToDemote)
+	demoteNodeToBackup(nodeToDemote)
 }

@@ -93,25 +93,25 @@ affinity:
 #### 4.2.1 主用节点故障
 1. 检测到主用节点故障
 2. 检查当前可用主用节点数量
-3. 如果可用主用节点数量不足，从备用节点中选择节点进行升级：
-   - 优先选择主用节点数量最少的可用区
+3. 检查故障节点所属的可用区，统计该可用区的可用主用节点数量
+4. 如果该可用区的可用主用节点数量不足，从同一可用区的备用节点中选择节点进行升级：
    - 在同一可用区内，选择资源最充足的节点（CPU优先，内存次之）
-4. 为选中的备用节点添加 `node-role.kubernetes.io/role=primary` 和 `node-role.kubernetes.io/promoted=true` 标签
+5. 为选中的备用节点添加 `node-role.kubernetes.io/role=primary` 和 `node-role.kubernetes.io/promoted=true` 标签
 
 #### 4.2.2 资源过载处理
 1. 检测到主用节点资源使用率超过90%
 2. 为该节点添加 `node-role.kubernetes.io/overloaded:NoSchedule` 污点
-3. 检查当前可用主用节点数量
-4. 如果可用主用节点数量不足，从备用节点中选择资源最充足且主用节点数量最少的可用区中的节点进行升级
+3. 检查过载节点所属的可用区，统计该可用区的可用主用节点数量
+4. 如果该可用区的可用主用节点数量不足，从同一可用区的备用节点中选择资源最充足的节点进行升级
 
 ### 4.3 节点恢复处理
 
 #### 4.3.1 故障节点恢复
 1. 检测到故障节点恢复为Ready状态
 2. 移除 `node-role.kubernetes.io/failed=true` 标签
-3. 检查当前备用节点数量和各可用区的主用节点分布
-4. 如果备用节点数量少于初始数量，将恢复的节点降级为备用节点
-5. 如果备用节点数量充足，检查是否有升级的备用节点可以降级，优先降级主用节点数量最多的可用区中的升级节点
+3. 检查恢复节点所属的可用区，统计该可用区的备用节点数量
+4. 如果该可用区的备用节点数量少于初始数量，将恢复的节点降级为备用节点
+5. 如果该可用区的备用节点数量充足，检查该可用区是否有升级的备用节点可以降级，优先降级该可用区中的升级节点
 
 #### 4.3.2 过载节点恢复
 1. 检测到过载节点资源使用率恢复正常
@@ -124,9 +124,9 @@ affinity:
 - 当备用节点因升级为主用节点而减少时，通过降级操作保持备用节点数量稳定
 
 #### 4.4.2 智能选择
-- 当需要升级备用节点时，选择资源最充足且主用节点数量最少的可用区中的节点
-- 当需要降级节点时，选择主用节点数量最多的可用区中的升级节点
-- 这样可以确保新升级的主用节点有足够的资源处理 workload，同时保持各可用区的节点分布均衡
+- 当需要升级备用节点时，只考虑同一可用区的备用节点，选择资源最充足的节点
+- 当需要降级节点时，只考虑同一可用区的升级节点
+- 这样可以确保每个可用区的节点数量保持平衡，避免跨可用区的节点迁移
 
 ### 4.5 多可用区支持
 
@@ -137,14 +137,16 @@ affinity:
   - `region-name.az03arm`
 
 #### 4.5.2 可用区均衡策略
-- **升级策略**：优先选择主用节点数量最少的可用区中的备用节点进行升级
-- **降级策略**：优先选择主用节点数量最多的可用区中的升级节点进行降级
+- **升级策略**：只考虑同一可用区的备用节点进行升级，不跨可用区操作
+- **降级策略**：只考虑同一可用区的升级节点进行降级，不跨可用区操作
 - **资源平衡**：在同一可用区内，选择资源最充足的节点进行升级
+- **数量平衡**：每个可用区的主用节点和备用节点数量保持独立平衡
 
 #### 4.5.3 高可用性保障
 - 确保每个可用区都有足够的主用节点和备用节点
-- 当某个可用区的主用节点全部故障时，其他可用区的备用节点可以及时补充
-- 通过多可用区分布，提高整个集群的容错能力
+- 当某个可用区的主用节点故障时，只从同一可用区的备用节点中选择节点进行升级
+- 通过可用区内的节点平衡，提高每个可用区的容错能力
+- 避免跨可用区的节点迁移，减少网络延迟和复杂性
 
 ## 5. 实现细节
 
@@ -160,13 +162,17 @@ affinity:
 | 函数名 | 功能描述 | 参数 | 返回值 |
 |-------|---------|------|-------|
 | `checkNodeStatus` | 检查节点状态并处理故障转移 | clientset *kubernetes.Clientset | 无 |
-| `promoteBackupNodes` | 升级备用节点为主用节点 | clientset *kubernetes.Clientset | 无 |
+| `promoteBackupNodes` | 升级备用节点为主用节点（多可用区模式下考虑可用区均衡） | clientset *kubernetes.Clientset | 无 |
+| `promoteBackupNodesInZone` | 升级指定可用区的备用节点为主用节点 | clientset *kubernetes.Clientset, zone string | 无 |
 | `demoteNodeToBackup` | 将节点降级为备用节点 | nodeName string | 无 |
-| `demotePromotedBackupNodes` | 降级升级的备用节点 | clientset *kubernetes.Clientset | 无 |
+| `demotePromotedBackupNodes` | 降级升级的备用节点（多可用区模式下考虑可用区均衡） | clientset *kubernetes.Clientset | 无 |
+| `demotePromotedBackupNodesInZone` | 降级指定可用区的升级节点 | clientset *kubernetes.Clientset, zone string | 无 |
 | `handleNodeRecovery` | 处理节点恢复 | node corev1.Node, clientset *kubernetes.Clientset | 无 |
 | `markNodeAsOverloaded` | 标记节点为过载 | nodeName string | 无 |
 | `removeNodeOverloadTaint` | 移除节点过载污点 | nodeName string | 无 |
 | `getNodeZone` | 获取节点所属的可用区 | node corev1.Node | string |
+| `countAvailablePrimaryNodesInZone` | 统计指定可用区的可用主用节点数量 | clientset *kubernetes.Clientset, zone string | int |
+| `checkAvailableBackupNodesInZone` | 检查指定可用区的可用备用节点数量 | clientset *kubernetes.Clientset, zone string | int |
 | `classifyNodesByZone` | 将节点按可用区分类 | nodes []corev1.Node | map[string]*zoneInfo |
 | `selectBackupNodeByZone` | 从备用节点中选择节点进行升级，考虑可用区均衡 | zoneMap map[string]*zoneInfo, clientset *kubernetes.Clientset | string |
 | `selectPromotedNodeToDemoteByZone` | 选择要降级的节点，考虑可用区均衡 | zoneMap map[string]*zoneInfo, clientset *kubernetes.Clientset | string |
