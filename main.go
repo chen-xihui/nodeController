@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
 	"strings"
@@ -1221,6 +1222,122 @@ func promoteBackupNodesInZone(clientset *kubernetes.Clientset, zone string) {
 
 	if len(availableBackupNodes) == 0 {
 		fmt.Printf("  ERROR: No available backup nodes in zone %s to promote\n", zone)
+
+		// Fallback: Check other zones for backup nodes
+		fmt.Printf("  INFO: Looking for backup nodes in other zones...\n")
+
+		// Find zones with available backup nodes
+		otherZoneBackupNodes := []struct {
+			name            string
+			zone            string
+			availableCPU    int64
+			availableMemory int64
+		}{}
+
+		for _, node := range nodes.Items {
+			// Check if node is in a different zone
+			nodeZone := getNodeZone(node)
+			if nodeZone == zone {
+				continue
+			}
+
+			// Check if node is a backup node (no role label)
+			if _, ok := node.Labels["node-role.kubernetes.io/role"]; !ok {
+				// Check if node is ready
+				isReady := false
+				for _, condition := range node.Status.Conditions {
+					if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+						isReady = true
+						break
+					}
+				}
+				if isReady {
+					// Calculate available resources
+					var availableCPU int64
+					var availableMemory int64
+
+					for resourceName, quantity := range node.Status.Allocatable {
+						if resourceName == "cpu" {
+							availableCPU = quantity.MilliValue()
+						} else if resourceName == "memory" {
+							availableMemory = quantity.Value()
+						}
+					}
+
+					for resourceName, quantity := range node.Status.Capacity {
+						if resourceName == "cpu" && availableCPU == 0 {
+							availableCPU = quantity.MilliValue()
+						} else if resourceName == "memory" && availableMemory == 0 {
+							availableMemory = quantity.Value()
+						}
+					}
+
+					otherZoneBackupNodes = append(otherZoneBackupNodes, struct {
+						name            string
+						zone            string
+						availableCPU    int64
+						availableMemory int64
+					}{
+						name:            node.Name,
+						zone:            nodeZone,
+						availableCPU:    availableCPU,
+						availableMemory: availableMemory,
+					})
+				}
+			}
+		}
+
+		if len(otherZoneBackupNodes) == 0 {
+			fmt.Printf("  ERROR: No available backup nodes in any zone to promote\n")
+			return
+		}
+
+		// Count backup nodes per zone
+		zoneBackupCounts := make(map[string]int)
+		for _, node := range otherZoneBackupNodes {
+			zoneBackupCounts[node.zone]++
+		}
+
+		// Find zone with most backup nodes
+		maxBackupCount := 0
+		var maxBackupZone string
+		for z, count := range zoneBackupCounts {
+			if count > maxBackupCount {
+				maxBackupCount = count
+				maxBackupZone = z
+			}
+		}
+
+		// Get backup nodes from the zone with most backup nodes
+		maxZoneBackupNodes := []struct {
+			name            string
+			zone            string
+			availableCPU    int64
+			availableMemory int64
+		}{}
+		for _, node := range otherZoneBackupNodes {
+			if node.zone == maxBackupZone {
+				maxZoneBackupNodes = append(maxZoneBackupNodes, node)
+			}
+		}
+
+		// Randomly select a node from the max zone
+		selectedNodeIndex := rand.Intn(len(maxZoneBackupNodes))
+		selectedNode := maxZoneBackupNodes[selectedNodeIndex]
+
+		fmt.Printf("  INFO: No backup nodes in zone %s, selecting node %s from zone %s (which has %d backup nodes)\n",
+			zone, selectedNode.name, selectedNode.zone, maxBackupCount)
+		fmt.Printf("  INFO: Promoting backup node %s from zone %s to primary in zone %s (Available CPU: %dm, Memory: %dMi)\n",
+			selectedNode.name, selectedNode.zone, zone, selectedNode.availableCPU, selectedNode.availableMemory/(1024*1024))
+
+		// Add primary label and promoted label to the backup node
+		cmd := exec.Command("kubectl", "label", "nodes", selectedNode.name, "node-role.kubernetes.io/role=primary", "node-role.kubernetes.io/promoted=true", "--overwrite")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("  ERROR: Failed to promote node %s: %s\n", selectedNode.name, string(output))
+		} else {
+			fmt.Printf("  SUCCESS: Node %s has been promoted to primary (moved from zone %s)\n", selectedNode.name, selectedNode.zone)
+		}
 		return
 	}
 
