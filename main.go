@@ -28,6 +28,8 @@ var (
 	resourceThreshold       float64
 	initialBackupNodesCount int
 	initPrimaryNodesCount   int
+	enableMultiAZ           bool
+	zoneLabels              []string
 )
 
 func init() {
@@ -39,7 +41,16 @@ func init() {
 	flag.BoolVar(&autoMode, "auto", false, "enable automatic mode")
 	flag.DurationVar(&interval, "interval", 30*time.Second, "check interval in automatic mode")
 	flag.Float64Var(&resourceThreshold, "threshold", 80.0, "resource usage threshold percentage")
+	flag.BoolVar(&enableMultiAZ, "multiaz", false, "enable multi-availability zone support")
 	flag.Parse()
+
+	if enableMultiAZ {
+		zoneLabels = []string{
+			"topology.kubernetes.io/zone=region-name.az01arm",
+			"topology.kubernetes.io/zone=region-name.az02arm",
+			"topology.kubernetes.io/zone=region-name.az03arm",
+		}
+	}
 }
 
 func main() {
@@ -71,15 +82,21 @@ func main() {
 func printUsage() {
 	fmt.Println("Node Controller Tool")
 	fmt.Println("Usage:")
-	fmt.Println("  nodecontroller auto [--kubeconfig=<path>] [--interval=<duration>] [--threshold=<percentage>]")
+	fmt.Println("  nodecontroller auto [--kubeconfig=<path>] [--interval=<duration>] [--threshold=<percentage>] [--multiaz]")
 	fmt.Println("  nodecontroller label <nodes> --role=<primary|backup>")
 	fmt.Println("  nodecontroller taint <nodes> --role=<primary|backup>")
 	fmt.Println("  nodecontroller status [nodes]")
 	fmt.Println("  nodecontroller monitor [--interval=<duration>]")
 	fmt.Println("  nodecontroller help")
 	fmt.Println()
+	fmt.Println("Options:")
+	fmt.Println("  --multiaz              Enable multi-availability zone support")
+	fmt.Println("  --interval=<duration>  Check interval in automatic mode (default: 30s)")
+	fmt.Println("  --threshold=<percentage> Resource usage threshold percentage (default: 80)")
+	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  nodecontroller auto --interval=1m --threshold=75")
+	fmt.Println("  nodecontroller auto --multiaz --interval=1m --threshold=75")
 	fmt.Println("  nodecontroller label node1 node2 --role=primary")
 	fmt.Println("  nodecontroller label node3 node4 --role=backup")
 	fmt.Println("  nodecontroller taint node1 node2 --role=primary")
@@ -93,6 +110,12 @@ func handleAutoCommand() {
 	fmt.Println("Starting automatic node controller...")
 	fmt.Printf("Check interval: %v\n", interval)
 	fmt.Printf("Resource threshold: %.1f%%\n", resourceThreshold)
+	if enableMultiAZ {
+		fmt.Println("Multi-AZ support: ENABLED")
+		fmt.Printf("Zone labels: %v\n", zoneLabels)
+	} else {
+		fmt.Println("Multi-AZ support: DISABLED")
+	}
 
 	for {
 		fmt.Println("\n--- Checking node status ---")
@@ -356,6 +379,12 @@ func checkAndUpdateNodeStatus() {
 	fmt.Printf("Initial backup nodes count: %d\n", initialBackupNodesCount)
 	fmt.Printf("Initial primary nodes count: %d\n", initPrimaryNodesCount)
 	fmt.Printf("Unlabeled nodes: %d\n", len(unlabeledNodes))
+
+	// Print zone distribution if multi-AZ is enabled
+	if enableMultiAZ {
+		zoneMap := classifyNodesByZone(nodes.Items)
+		printZoneDistribution(zoneMap)
+	}
 
 	// Check primary nodes status
 	for _, node := range primaryNodes {
@@ -659,6 +688,19 @@ func demotePromotedBackupNodes(clientset *kubernetes.Clientset) {
 		return
 	}
 
+	// If multi-AZ is enabled, use zone-aware demotion logic
+	if enableMultiAZ {
+		zoneMap := classifyNodesByZone(nodes.Items)
+		printZoneDistribution(zoneMap)
+
+		selectedNodeName := selectPromotedNodeToDemoteByZone(zoneMap, clientset)
+		if selectedNodeName != "" {
+			fmt.Printf("  INFO: Demoting promoted node %s back to backup\n", selectedNodeName)
+			demoteNodeToBackup(selectedNodeName)
+		}
+		return
+	}
+
 	// Count available primary nodes
 	availablePrimaryNodes := countAvailablePrimaryNodes(clientset)
 
@@ -703,6 +745,28 @@ func promoteBackupNodes(clientset *kubernetes.Clientset) {
 	nodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		fmt.Printf("  ERROR: Failed to list nodes: %v\n", err)
+		return
+	}
+
+	// If multi-AZ is enabled, use zone-aware promotion logic
+	if enableMultiAZ {
+		zoneMap := classifyNodesByZone(nodes.Items)
+		printZoneDistribution(zoneMap)
+
+		selectedNodeName := selectBackupNodeByZone(zoneMap, clientset)
+		if selectedNodeName == "" {
+			fmt.Printf("  ERROR: No available backup nodes to promote\n")
+			return
+		}
+
+		// Add primary label and promoted label to the backup node
+		cmd := exec.Command("kubectl", "label", "nodes", selectedNodeName, "node-role.kubernetes.io/role=primary", "node-role.kubernetes.io/promoted=true", "--overwrite")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("  ERROR: Failed to promote node %s: %s\n", selectedNodeName, string(output))
+		} else {
+			fmt.Printf("  SUCCESS: Node %s has been promoted to primary\n", selectedNodeName)
+		}
 		return
 	}
 
@@ -781,4 +845,224 @@ func promoteBackupNodes(clientset *kubernetes.Clientset) {
 	} else {
 		fmt.Printf("  SUCCESS: Node %s has been promoted to primary\n", selectedNode.name)
 	}
+}
+
+type zoneInfo struct {
+	zoneLabel    string
+	primaryNodes []corev1.Node
+	backupNodes  []corev1.Node
+	primaryCount int
+	backupCount  int
+}
+
+func getNodeZone(node corev1.Node) string {
+	if zone, ok := node.Labels["topology.kubernetes.io/zone"]; ok {
+		return zone
+	}
+	return ""
+}
+
+func classifyNodesByZone(nodes []corev1.Node) map[string]*zoneInfo {
+	zoneMap := make(map[string]*zoneInfo)
+
+	for _, node := range nodes {
+		zone := getNodeZone(node)
+		if zone == "" {
+			continue
+		}
+
+		if _, exists := zoneMap[zone]; !exists {
+			zoneMap[zone] = &zoneInfo{
+				zoneLabel:    zone,
+				primaryNodes: []corev1.Node{},
+				backupNodes:  []corev1.Node{},
+			}
+		}
+
+		if val, ok := node.Labels["node-role.kubernetes.io/role"]; ok && val == "primary" {
+			zoneMap[zone].primaryNodes = append(zoneMap[zone].primaryNodes, node)
+		} else {
+			zoneMap[zone].backupNodes = append(zoneMap[zone].backupNodes, node)
+		}
+	}
+
+	for _, info := range zoneMap {
+		info.primaryCount = len(info.primaryNodes)
+		info.backupCount = len(info.backupNodes)
+	}
+
+	return zoneMap
+}
+
+func printZoneDistribution(zoneMap map[string]*zoneInfo) {
+	if !enableMultiAZ {
+		return
+	}
+
+	fmt.Println("\n=== Multi-AZ Node Distribution ===")
+	for zone, info := range zoneMap {
+		fmt.Printf("Zone %s:\n", zone)
+		fmt.Printf("  Primary nodes: %d\n", info.primaryCount)
+		for _, node := range info.primaryNodes {
+			fmt.Printf("    - %s\n", node.Name)
+		}
+		fmt.Printf("  Backup nodes: %d\n", info.backupCount)
+		for _, node := range info.backupNodes {
+			fmt.Printf("    - %s\n", node.Name)
+		}
+	}
+}
+
+func selectBackupNodeByZone(zoneMap map[string]*zoneInfo, clientset *kubernetes.Clientset) string {
+	if !enableMultiAZ {
+		return ""
+	}
+
+	type backupNodeWithResources struct {
+		name            string
+		zone            string
+		availableCPU    int64
+		availableMemory int64
+	}
+
+	availableBackupNodes := []backupNodeWithResources{}
+
+	for zone, info := range zoneMap {
+		for _, node := range info.backupNodes {
+			isReady := false
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+					isReady = true
+					break
+				}
+			}
+
+			if isReady {
+				var availableCPU int64
+				var availableMemory int64
+
+				for resourceName, quantity := range node.Status.Allocatable {
+					if resourceName == "cpu" {
+						availableCPU = quantity.MilliValue()
+					} else if resourceName == "memory" {
+						availableMemory = quantity.Value()
+					}
+				}
+
+				for resourceName, quantity := range node.Status.Capacity {
+					if resourceName == "cpu" && availableCPU == 0 {
+						availableCPU = quantity.MilliValue()
+					} else if resourceName == "memory" && availableMemory == 0 {
+						availableMemory = quantity.Value()
+					}
+				}
+
+				availableBackupNodes = append(availableBackupNodes, backupNodeWithResources{
+					name:            node.Name,
+					zone:            zone,
+					availableCPU:    availableCPU,
+					availableMemory: availableMemory,
+				})
+			}
+		}
+	}
+
+	if len(availableBackupNodes) == 0 {
+		return ""
+	}
+
+	zonePrimaryCounts := make(map[string]int)
+	for zone, info := range zoneMap {
+		zonePrimaryCounts[zone] = info.primaryCount
+	}
+
+	minPrimaryCount := int(^uint(0) >> 1)
+	for _, count := range zonePrimaryCounts {
+		if count < minPrimaryCount {
+			minPrimaryCount = count
+		}
+	}
+
+	minZoneNodes := []backupNodeWithResources{}
+	for _, node := range availableBackupNodes {
+		if zonePrimaryCounts[node.zone] == minPrimaryCount {
+			minZoneNodes = append(minZoneNodes, node)
+		}
+	}
+
+	if len(minZoneNodes) == 0 {
+		minZoneNodes = availableBackupNodes
+	}
+
+	selectedNode := minZoneNodes[0]
+	for _, node := range minZoneNodes {
+		if node.availableCPU > selectedNode.availableCPU {
+			selectedNode = node
+		} else if node.availableCPU == selectedNode.availableCPU && node.availableMemory > selectedNode.availableMemory {
+			selectedNode = node
+		}
+	}
+
+	fmt.Printf("  INFO: Selected backup node %s from zone %s for promotion (Available CPU: %dm, Memory: %dMi)\n",
+		selectedNode.name, selectedNode.zone, selectedNode.availableCPU, selectedNode.availableMemory/(1024*1024))
+
+	return selectedNode.name
+}
+
+func selectPromotedNodeToDemoteByZone(zoneMap map[string]*zoneInfo, clientset *kubernetes.Clientset) string {
+	if !enableMultiAZ {
+		return ""
+	}
+
+	availablePrimaryNodes := countAvailablePrimaryNodes(clientset)
+	if availablePrimaryNodes <= initPrimaryNodesCount {
+		return ""
+	}
+
+	type promotedNodeWithZone struct {
+		name string
+		zone string
+	}
+
+	promotedNodes := []promotedNodeWithZone{}
+
+	for zone, info := range zoneMap {
+		for _, node := range info.primaryNodes {
+			if _, promoted := node.Labels["node-role.kubernetes.io/promoted"]; promoted {
+				promotedNodes = append(promotedNodes, promotedNodeWithZone{
+					name: node.Name,
+					zone: zone,
+				})
+			}
+		}
+	}
+
+	if len(promotedNodes) == 0 {
+		return ""
+	}
+
+	zonePrimaryCounts := make(map[string]int)
+	for zone, info := range zoneMap {
+		zonePrimaryCounts[zone] = info.primaryCount
+	}
+
+	maxPrimaryCount := 0
+	for _, count := range zonePrimaryCounts {
+		if count > maxPrimaryCount {
+			maxPrimaryCount = count
+		}
+	}
+
+	maxZoneNodes := []promotedNodeWithZone{}
+	for _, node := range promotedNodes {
+		if zonePrimaryCounts[node.zone] == maxPrimaryCount {
+			maxZoneNodes = append(maxZoneNodes, node)
+		}
+	}
+
+	if len(maxZoneNodes) > 0 {
+		return maxZoneNodes[0].name
+	}
+
+	return promotedNodes[0].name
 }
