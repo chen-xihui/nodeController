@@ -706,8 +706,15 @@ func promoteBackupNodes(clientset *kubernetes.Clientset) {
 		return
 	}
 
-	// Find available backup nodes (nodes without role label)
-	backupNodes := []string{}
+	// Find available backup nodes (nodes without role label) and their available resources
+	type backupNodeWithResources struct {
+		name            string
+		availableCPU    int64
+		availableMemory int64
+	}
+
+	availableBackupNodes := []backupNodeWithResources{}
+
 	for _, node := range nodes.Items {
 		if _, ok := node.Labels["node-role.kubernetes.io/role"]; !ok {
 			// Check if node is ready
@@ -719,26 +726,59 @@ func promoteBackupNodes(clientset *kubernetes.Clientset) {
 				}
 			}
 			if isReady {
-				backupNodes = append(backupNodes, node.Name)
+				// Calculate available resources
+				var availableCPU int64
+				var availableMemory int64
+
+				for resourceName, quantity := range node.Status.Allocatable {
+					if resourceName == "cpu" {
+						availableCPU = quantity.MilliValue()
+					} else if resourceName == "memory" {
+						availableMemory = quantity.Value()
+					}
+				}
+
+				for resourceName, quantity := range node.Status.Capacity {
+					if resourceName == "cpu" && availableCPU == 0 {
+						availableCPU = quantity.MilliValue()
+					} else if resourceName == "memory" && availableMemory == 0 {
+						availableMemory = quantity.Value()
+					}
+				}
+
+				availableBackupNodes = append(availableBackupNodes, backupNodeWithResources{
+					name:            node.Name,
+					availableCPU:    availableCPU,
+					availableMemory: availableMemory,
+				})
 			}
 		}
 	}
 
-	if len(backupNodes) == 0 {
+	if len(availableBackupNodes) == 0 {
 		fmt.Printf("  ERROR: No available backup nodes to promote\n")
 		return
 	}
 
-	// Promote the first available backup node
-	selectedNode := backupNodes[0]
-	fmt.Printf("  INFO: Promoting backup node %s to primary\n", selectedNode)
+	// Select the backup node with the most available resources (using CPU as primary metric, memory as secondary)
+	selectedNode := availableBackupNodes[0]
+	for _, node := range availableBackupNodes {
+		if node.availableCPU > selectedNode.availableCPU {
+			selectedNode = node
+		} else if node.availableCPU == selectedNode.availableCPU && node.availableMemory > selectedNode.availableMemory {
+			selectedNode = node
+		}
+	}
+
+	fmt.Printf("  INFO: Promoting backup node %s to primary (Available CPU: %dm, Memory: %dMi)\n",
+		selectedNode.name, selectedNode.availableCPU, selectedNode.availableMemory/(1024*1024))
 
 	// Add primary label and promoted label to the backup node
-	cmd := exec.Command("kubectl", "label", "nodes", selectedNode, "node-role.kubernetes.io/role=primary", "node-role.kubernetes.io/promoted=true", "--overwrite")
+	cmd := exec.Command("kubectl", "label", "nodes", selectedNode.name, "node-role.kubernetes.io/role=primary", "node-role.kubernetes.io/promoted=true", "--overwrite")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		fmt.Printf("  ERROR: Failed to promote node %s: %s\n", selectedNode, string(output))
+		fmt.Printf("  ERROR: Failed to promote node %s: %s\n", selectedNode.name, string(output))
 	} else {
-		fmt.Printf("  SUCCESS: Node %s has been promoted to primary\n", selectedNode)
+		fmt.Printf("  SUCCESS: Node %s has been promoted to primary\n", selectedNode.name)
 	}
 }
