@@ -69,7 +69,7 @@ affinity:
 3. 执行编译命令：
 
 ```bash
-go build -o nodecontroller.exe main.go
+go build -o nodecontroller.exe -mod=mod ./cmd/nodecontroller
 ```
 
 4. 添加到系统PATH（可选）
