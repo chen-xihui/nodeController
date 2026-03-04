@@ -208,6 +208,24 @@ nodecontroller/
 - 内存使用率格式：`XX%`（如 "45%"）
 - 阈值检查：将使用率百分比与配置的阈值（默认90%）比较，超过阈值则标记为过载节点
 
+**方式一（推荐）：使用 Kubernetes Metrics API 获取资源使用情况**
+- 依赖 Kubernetes metrics-server 组件
+- 通过直接调用 Kubernetes Metrics API 获取节点的实时资源使用情况
+- 使用 `k8s.io/metrics` 包中的客户端库
+- 步骤：
+  1. 添加 metrics API 依赖：`go get k8s.io/metrics@v0.27.4`
+  2. 导入必要的包：`k8s.io/metrics/pkg/apis/metrics/v1beta1` 和 `k8s.io/metrics/pkg/client/clientset/versioned`
+  3. 创建 metrics 客户端
+  4. 调用 `NodeMetricses().Get()` 方法获取节点指标
+  5. 从返回的 `NodeMetrics` 对象中提取 CPU 和内存使用情况
+  6. 计算资源使用率：使用率 = (已使用资源 / 可分配资源) * 100%
+  7. 阈值检查：将使用率与配置的阈值比较，超过阈值则标记为过载节点
+- 优点：
+  - 结构化数据，易于处理
+  - 直接集成到代码中，无需执行外部命令
+  - 与 Kubernetes 原生集成
+  - 更可靠的错误处理
+
 **方式二：可用资源计算（用于备用节点选择）**
 - 通过 Kubernetes API 获取节点资源信息
 - 优先使用 `node.Status.Allocatable`（可分配资源）

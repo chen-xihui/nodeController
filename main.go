@@ -494,6 +494,7 @@ func checkNodeStatus(node corev1.Node, role string, clientset *kubernetes.Client
 	}
 
 	// Check resource usage
+	// 当前实现：使用 kubectl top 命令获取节点资源使用情况
 	cmd := exec.Command("kubectl", "top", "node", node.Name)
 	output, err := cmd.CombinedOutput()
 	if err == nil {
@@ -544,6 +545,74 @@ func checkNodeStatus(node corev1.Node, role string, clientset *kubernetes.Client
 			}
 		}
 	}
+
+	/*
+	// 方法1：使用 Kubernetes Metrics API 获取节点资源使用情况
+	// 步骤：
+	// 1. 添加 metrics API 依赖
+	//    go get k8s.io/metrics@v0.27.4
+	//
+	// 2. 导入必要的包
+	//    import (
+	//        "k8s.io/metrics/pkg/apis/metrics/v1beta1"
+	//        "k8s.io/metrics/pkg/client/clientset/versioned"
+	//    )
+	//
+	// 3. 创建 metrics 客户端
+	//    metricsConfig, err := rest.InClusterConfig()
+	//    if err != nil {
+	//        fmt.Printf("  ERROR: Failed to get in-cluster config: %v\n", err)
+	//        return
+	//    }
+	//    
+	//    metricsClient, err := versioned.NewForConfig(metricsConfig)
+	//    if err != nil {
+	//        fmt.Printf("  ERROR: Failed to create metrics client: %v\n", err)
+	//        return
+	//    }
+	//
+	// 4. 获取节点指标
+	//    nodeMetrics, err := metricsClient.MetricsV1beta1().NodeMetricses().Get(context.TODO(), node.Name, metav1.GetOptions{})
+	//    if err != nil {
+	//        fmt.Printf("  ERROR: Failed to get node metrics: %v\n", err)
+	//        return
+	//    }
+	//
+	// 5. 计算资源使用率
+	//    // 获取节点可分配资源
+	//    var allocatableCPU int64
+	//    var allocatableMemory int64
+	//    
+	//    if cpu, ok := node.Status.Allocatable["cpu"]; ok {
+	//        allocatableCPU = cpu.MilliValue()
+	//    } else if cpu, ok := node.Status.Capacity["cpu"]; ok {
+	//        allocatableCPU = cpu.MilliValue()
+	//    }
+	//    
+	//    if memory, ok := node.Status.Allocatable["memory"]; ok {
+	//        allocatableMemory = memory.Value()
+	//    } else if memory, ok := node.Status.Capacity["memory"]; ok {
+	//        allocatableMemory = memory.Value()
+	//    }
+	//
+	//    // 获取使用的资源
+	//    usedCPU := nodeMetrics.Usage["cpu"].MilliValue()
+	//    usedMemory := nodeMetrics.Usage["memory"].Value()
+	//
+	//    // 计算使用率
+	//    cpuUsagePercent := float64(usedCPU) / float64(allocatableCPU) * 100
+	//    memoryUsagePercent := float64(usedMemory) / float64(allocatableMemory) * 100
+	//
+	//    fmt.Printf("  Resource usage: CPU=%.1f%%, Memory=%.1f%%\n", cpuUsagePercent, memoryUsagePercent)
+	//
+	// 6. 检查资源使用是否超过阈值
+	//    if role == "primary" {
+	//        if cpuUsagePercent > resourceThreshold || memoryUsagePercent > resourceThreshold {
+	//            fmt.Printf("  WARNING: Resource usage exceeds threshold!\n")
+	//            // 后续逻辑与当前实现相同
+	//        }
+	//    }
+	*/
 
 	// Check if node has correct label
 	hasCorrectLabel := false
